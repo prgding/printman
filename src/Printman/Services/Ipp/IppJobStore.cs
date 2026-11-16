@@ -1,4 +1,4 @@
-using System.Collections.Concurrent;
+using System.Security.Cryptography;
 using Printman.Core.Abstractions;
 using Printman.Core.Models;
 
@@ -10,41 +10,62 @@ public class IppJobStore : IIppJobStore
     private static readonly TimeSpan RetainFinishedFor = TimeSpan.FromHours(1);
     private const int MaxFinishedJobs = 100;
 
-    private readonly ConcurrentDictionary<int, IppJob> _jobs = new();
-    private int _nextId;
+    private readonly Dictionary<int, IppJob> _jobs = new();
+    private readonly object _sync = new();
 
-    public IppJob Create(string printerSlug, string name, string userName, IppJobOptions options)
+    public IppJob Create(string printerSlug, string name, string userName, IppJobOptions options, string? sourceAddress = null, int maxActiveJobs = 50)
     {
-        Sweep();
-        var job = new IppJob
+        lock (_sync)
         {
-            Id = Interlocked.Increment(ref _nextId),
-            PrinterSlug = printerSlug,
-            Name = name,
-            UserName = userName,
-            Options = options
-        };
-        _jobs[job.Id] = job;
-        return job;
+            Sweep();
+            // The limit applies across every printer and includes uploads awaiting their document.
+            if (_jobs.Values.Count(j => !IppJobState.IsTerminal(j.GetState().State)) >= maxActiveJobs)
+                throw new IppQueueFullException();
+            int id;
+            do { id = RandomNumberGenerator.GetInt32(1, int.MaxValue); } while (_jobs.ContainsKey(id));
+            var job = new IppJob
+            {
+                Id = id,
+                SourceAddress = sourceAddress,
+                PrinterSlug = printerSlug,
+                Name = name,
+                UserName = userName,
+                Options = options
+            };
+            _jobs[job.Id] = job;
+            return job;
+        }
     }
 
     public IppJob? Get(int jobId)
     {
-        Sweep();
-        return _jobs.TryGetValue(jobId, out var job) ? job : null;
+        lock (_sync)
+        {
+            Sweep();
+            return _jobs.TryGetValue(jobId, out var job) ? job : null;
+        }
     }
 
     public IReadOnlyList<IppJob> List(string printerSlug)
     {
-        Sweep();
-        return _jobs.Values
-            .Where(j => j.PrinterSlug == printerSlug)
-            .OrderBy(j => j.Id)
-            .ToList();
+        lock (_sync)
+        {
+            Sweep();
+            return _jobs.Values
+                .Where(j => j.PrinterSlug == printerSlug)
+                .OrderBy(j => j.CreatedAt)
+                .ToList();
+        }
     }
 
-    public int ActiveCount(string printerSlug) =>
-        _jobs.Values.Count(j => j.PrinterSlug == printerSlug && !IppJobState.IsTerminal(j.GetState().State));
+    public int ActiveCount(string printerSlug)
+    {
+        lock (_sync)
+        {
+            Sweep();
+            return _jobs.Values.Count(j => j.PrinterSlug == printerSlug && !IppJobState.IsTerminal(j.GetState().State));
+        }
+    }
 
     private void Sweep()
     {
@@ -61,7 +82,7 @@ public class IppJobStore : IIppJobStore
 
         var finished = _jobs.Values
             .Where(j => IppJobState.IsTerminal(j.GetState().State))
-            .OrderByDescending(j => j.Id)
+            .OrderByDescending(j => j.CreatedAt)
             .ToList();
 
         for (int i = 0; i < finished.Count; i++)
@@ -69,8 +90,10 @@ public class IppJobStore : IIppJobStore
             var job = finished[i];
             if (i >= MaxFinishedJobs || (job.CompletedAt is DateTime done && now - done > RetainFinishedFor))
             {
-                _jobs.TryRemove(job.Id, out _);
+                _jobs.Remove(job.Id);
             }
         }
     }
 }
+
+public sealed class IppQueueFullException() : Exception("Print queue is full.");

@@ -45,7 +45,7 @@ public static class IppEndpoints
         }
 
         // Requiring application/ipp also stops browsers from posting cross-site forms here
-        if (ctx.Request.ContentType?.StartsWith("application/ipp", StringComparison.OrdinalIgnoreCase) != true)
+        if (!string.Equals(ctx.Request.ContentType?.Split(';')[0].Trim(), "application/ipp", StringComparison.OrdinalIgnoreCase))
         {
             ctx.Response.StatusCode = StatusCodes.Status415UnsupportedMediaType;
             return;
@@ -67,14 +67,17 @@ public static class IppEndpoints
         var slug = rest?.Split('/', StringSplitOptions.RemoveEmptyEntries).FirstOrDefault();
         var host = ctx.Request.Host.HasValue ? ctx.Request.Host.Value! : $"{ctx.Connection.LocalIpAddress}:{ctx.Connection.LocalPort}";
 
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ctx.RequestAborted);
+        timeout.CancelAfter(settings.RequestTimeout);
         byte[] response;
         try
         {
             await using var body = new BufferedStream(ctx.Request.Body, 16 * 1024);
-            response = await handler.HandleAsync(new IppRequestContext(body, slug, host, remote), ctx.RequestAborted);
+            response = await handler.HandleAsync(new IppRequestContext(body, slug, host, remote), timeout.Token);
         }
         catch (OperationCanceledException)
         {
+            ctx.Abort();
             return;
         }
         catch (BadHttpRequestException)

@@ -5,7 +5,7 @@ public sealed class TempDirectory : IDisposable
 {
     public TempDirectory()
     {
-        Path = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "printman-tests-" + Guid.NewGuid().ToString("N"));
+        Path = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "pm-" + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(Path);
     }
 

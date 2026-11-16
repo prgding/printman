@@ -10,10 +10,13 @@ public partial class ImageDocumentRenderer : IGdiDocumentRenderer
     public Task<int> GetPageCountAsync(string filePath)
     {
         using var image = Image.FromFile(filePath);
+        DocumentRenderLimits.ValidateDimensions(image.Width, image.Height);
         if (image.FrameDimensionsList.Contains(FrameDimension.Page.Guid))
         {
             var dimension = new FrameDimension(FrameDimension.Page.Guid);
-            return Task.FromResult(image.GetFrameCount(dimension));
+            int pages = image.GetFrameCount(dimension);
+            DocumentRenderLimits.ValidatePageCount(pages);
+            return Task.FromResult(pages);
         }
 
         return Task.FromResult(1);
@@ -28,17 +31,20 @@ public partial class ImageDocumentRenderer : IGdiDocumentRenderer
         bool fitToPage)
     {
         using var image = Image.FromFile(filePath);
+        DocumentRenderLimits.ValidateDimensions(image.Width, image.Height);
 
         if (image.FrameDimensionsList.Contains(FrameDimension.Page.Guid))
         {
             var dimension = new FrameDimension(FrameDimension.Page.Guid);
             int frameCount = image.GetFrameCount(dimension);
+            DocumentRenderLimits.ValidatePageCount(frameCount);
             if (pageNumber < 1 || pageNumber > frameCount)
             {
                 throw new ArgumentOutOfRangeException(nameof(pageNumber),
                     $"Requested frame {pageNumber} is outside the image frames range (1 to {frameCount}).");
             }
             image.SelectActiveFrame(dimension, pageNumber - 1);
+            DocumentRenderLimits.ValidateDimensions(image.Width, image.Height);
         }
 
         graphics.InterpolationMode = InterpolationMode.HighQualityBicubic;

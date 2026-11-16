@@ -1,4 +1,3 @@
-using System.Drawing;
 using Printman.Core.Abstractions;
 using Printman.Core.Models;
 using Printman.Services;
@@ -206,6 +205,16 @@ public sealed class PrintJobValidatorTests
         PageRange = range ?? PageRange.All
     };
 
+    [TestMethod]
+    public async Task Validate_ExcessivePageCount_FailsBeforeResolvingRange()
+    {
+        using var fx = new ValidatorFixture();
+        fx.Renderer.PageCount = 1001;
+        var result = await fx.Validator.ValidateAsync(Request(fx.WriteFile()));
+        Assert.IsFalse(result.IsValid);
+        StringAssert.Contains(result.ErrorMessage!, "1000-page limit");
+    }
+
     private sealed class ValidatorFixture : IDisposable
     {
         public ValidatorFixture(IDocumentRenderer? renderer = null)
@@ -244,7 +253,6 @@ public sealed class PrintJobValidatorTests
         public Task<int> GetPageCountAsync(string filePath) =>
             Task.FromException<int>(new InvalidOperationException("corrupt document"));
 
-        public Task RenderPageAsync(string filePath, int pageNumber, Graphics graphics, Rectangle printableArea, int dpi, bool fitToPage) =>
-            Task.CompletedTask;
+
     }
 }

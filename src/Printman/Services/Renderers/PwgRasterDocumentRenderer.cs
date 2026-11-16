@@ -45,6 +45,7 @@ public class PwgRasterDocumentRenderer : RasterDocumentRenderer
             };
 
             var page = CreatePage(stream.Position, width, height, bitsPerPixel, space, dpi);
+            DocumentRenderLimits.ValidatePageCount(pages.Count + 1);
             pages.Add(page);
             SkipPage(stream, page);
         }

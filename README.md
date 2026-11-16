@@ -289,3 +289,7 @@ dotnet publish src/Printman/Printman.csproj -c Release -r <rid> --self-contained
 - **Support:** If Printman saved you time or rescued an old printer, consider [buying me a coffee](https://buymeacoffee.com/eslamx7) ☕.
 
 > *Built with AI assistance using Antigravity powered by Gemini.*
+
+## Enterprise Windows security evaluation
+
+The `security/enterprise-ipp` branch adds security fixes and regression tests. Windows native printer enrollment, USB drivers and unattended service operation require environment validation. See [the Windows security and acceptance plan](docs/enterprise-windows-security.md).

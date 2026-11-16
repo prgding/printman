@@ -9,11 +9,12 @@ namespace Printman.Tests.Services;
 public sealed class ServiceBranchTests
 {
     [TestMethod]
-    public void FileCacheService_DefaultConstructor_UsesExecutableCacheFolder()
+    public void FileCacheService_DefaultConstructor_UsesPlatformCacheFolder()
     {
         var cache = new FileCacheService();
 
-        Assert.AreEqual(Path.Combine(AppContext.BaseDirectory, "cache"), cache.CacheDirectory);
+        Assert.AreEqual(FileCacheService.DefaultCacheDirectory(OperatingSystem.IsWindows(), AppContext.BaseDirectory,
+            Environment.GetEnvironmentVariable("XDG_CACHE_HOME"), Environment.GetFolderPath(Environment.SpecialFolder.UserProfile)), cache.CacheDirectory);
         Assert.IsTrue(Directory.Exists(cache.CacheDirectory));
     }
 

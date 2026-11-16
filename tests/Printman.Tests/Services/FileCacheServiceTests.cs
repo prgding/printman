@@ -90,7 +90,7 @@ public sealed class FileCacheServiceTests
         Assert.AreEqual(expectedExtension, result.Extension);
         Assert.AreEqual(4L, result.FileSizeBytes);
         Assert.IsFalse(result.IsDuplicate);
-        Assert.AreEqual(16, result.FileId.Length);
+        Assert.AreEqual(64, result.FileId.Length);
         Assert.IsTrue(File.Exists(result.CachedFilePath));
         Assert.IsTrue(result.CachedFilePath.EndsWith(expectedExtension, StringComparison.Ordinal));
         Assert.AreEqual(1, Directory.GetFiles(temp.Path).Length);
@@ -142,7 +142,7 @@ public sealed class FileCacheServiceTests
 
         Assert.IsFalse(first.IsDuplicate);
         Assert.IsFalse(second.IsDuplicate);
-        Assert.AreEqual(first.FileId, second.FileId);
+        Assert.AreNotEqual(first.FileId, second.FileId);
         Assert.AreNotEqual(first.CachedFilePath, second.CachedFilePath);
         Assert.AreEqual(2, Directory.GetFiles(temp.Path).Length);
     }
@@ -327,6 +327,8 @@ public sealed class FileCacheServiceTests
     [TestMethod]
     public async Task CleanupOldFilesAsync_LockedFile_IsLeftInPlace()
     {
+
+        if (!OperatingSystem.IsWindows()) Assert.Inconclusive("Windows file sharing semantics.");
         using var temp = new TempDirectory();
         var service = new FileCacheService(temp.Path);
         var stored = await StoreAsync(service, "locked.txt", new string('l', 200));
@@ -449,6 +451,8 @@ public sealed class FileCacheServiceTests
     [TestMethod]
     public async Task DeleteFile_LockedFile_ReturnsFalseAndLeavesFile()
     {
+
+        if (!OperatingSystem.IsWindows()) Assert.Inconclusive("Windows file sharing semantics.");
         using var temp = new TempDirectory();
         var service = new FileCacheService(temp.Path);
         var stored = await StoreAsync(service, "locked.pdf", "locked");

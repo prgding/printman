@@ -72,6 +72,10 @@ public class IppRequestHandler(
             };
             return Encode(response);
         }
+        catch (IppQueueFullException)
+        {
+            return Encode(Response(request, IppStatus.Busy, "Printer queue is full, try again later."));
+        }
         catch (OperationCanceledException)
         {
             throw;
@@ -109,12 +113,8 @@ public class IppRequestHandler(
 
     private async Task<IppMessage> PrintJobAsync(Call call, CancellationToken ct)
     {
-        if (IsBusy(call.Printer))
-        {
-            return Response(call.Request, IppStatus.Busy, "Printer queue is full, try again later.");
-        }
-
         var job = CreateJobRecord(call);
+        job.TryBeginDocument();
         var (status, message) = await ReceiveDocumentAsync(call, job, ct);
         if (status != IppStatus.Ok)
         {
@@ -127,11 +127,6 @@ public class IppRequestHandler(
 
     private IppMessage CreateJob(Call call)
     {
-        if (IsBusy(call.Printer))
-        {
-            return Response(call.Request, IppStatus.Busy, "Printer queue is full, try again later.");
-        }
-
         var job = CreateJobRecord(call);
         return JobResponse(call, job);
     }
@@ -146,7 +141,7 @@ public class IppRequestHandler(
 
         bool lastDocument = call.Request.FindRequestAttribute("last-document")?.First?.AsBool() ?? true;
 
-        if (!job.AwaitingDocument)
+        if (!job.TryBeginDocument())
         {
             if (job.Ticket != null && lastDocument && !await HasMoreDataAsync(call.Context.Body, ct))
             {
@@ -214,13 +209,14 @@ public class IppRequestHandler(
         }
 
         var jobs = _jobStore.List(call.Printer.Slug)
+            .Where(j => OwnsJob(call, j))
             .Where(j =>
             {
                 bool terminal = IppJobState.IsTerminal(j.GetState().State);
                 return which == "all" || (which == "completed" ? terminal : !terminal);
             })
             .Where(j => !myJobs || user == null || string.Equals(j.UserName, user, StringComparison.OrdinalIgnoreCase))
-            .OrderByDescending(j => j.Id)
+            .OrderByDescending(j => j.CreatedAt)
             .Take(Math.Max(1, limit));
 
         var response = Response(call.Request, IppStatus.Ok);
@@ -260,6 +256,7 @@ public class IppRequestHandler(
 
         foreach (var job in _jobStore.List(call.Printer.Slug))
         {
+            if (!OwnsJob(call, job)) continue;
             if (ids != null && !ids.Contains(job.Id)) continue;
             if (user != null && !string.Equals(job.UserName, user, StringComparison.OrdinalIgnoreCase)) continue;
             TryCancel(job);
@@ -285,9 +282,6 @@ public class IppRequestHandler(
 
     // ---------------------------------------------------------------- Job helpers
 
-    private bool IsBusy(SharedPrinter printer) =>
-        _jobStore.ActiveCount(printer.Slug) >= _settings.MaxPendingJobs;
-
     private IppJob CreateJobRecord(Call call)
     {
         var request = call.Request;
@@ -304,7 +298,7 @@ public class IppRequestHandler(
             name = "Network print job";
         }
 
-        return _jobStore.Create(call.Printer.Slug, name.Trim(), user.Trim(), ParseJobOptions(call));
+        return _jobStore.Create(call.Printer.Slug, name.Trim(), user.Trim(), ParseJobOptions(call), SourceAddress(call), _settings.MaxPendingJobs);
     }
 
     private IppJobOptions ParseJobOptions(Call call)
@@ -391,6 +385,19 @@ public class IppRequestHandler(
 
     private async Task<(short Status, string? Message)> ReceiveDocumentAsync(Call call, IppJob job, CancellationToken ct)
     {
+        try
+        {
+            return await StoreDocumentAsync(call, job, ct);
+        }
+        catch
+        {
+            job.Terminate(IppJobState.Aborted, "aborted-by-system");
+            throw;
+        }
+    }
+
+    private async Task<(short Status, string? Message)> StoreDocumentAsync(Call call, IppJob job, CancellationToken ct)
+    {
         var declared = call.Request.FindRequestAttribute("document-format")?.First?.AsString();
 
         var head = new byte[16];
@@ -444,13 +451,17 @@ public class IppRequestHandler(
             FullPage = true
         };
 
-        var ticket = _pipeline.Enqueue(new PipelineBatch
+        var ticket = job.Submit(() => _pipeline.Enqueue(new PipelineBatch
         {
             Printer = call.Printer.SystemName,
             Items = [item],
             Source = "ipp"
-        });
-        job.Attach(ticket, format);
+        }), format);
+        if (ticket == null || ticket.State == PipelineJobState.Failed)
+        {
+            _fileCache.DeleteFile(cached.FileId);
+            return (IppStatus.Busy, "Job canceled or print queue unavailable.");
+        }
 
         Console.ForegroundColor = ConsoleColor.Cyan;
         Console.WriteLine($"  [IPP] Job #{job.Id} '{job.Name}' from {job.UserName} ({call.Context.RemoteAddress}) -> {call.Printer.SystemName} [{format}, {cached.FileSizeBytes / 1024} KB]");
@@ -468,21 +479,12 @@ public class IppRequestHandler(
         return (IppStatus.Ok, null);
     }
 
-    private static bool TryCancel(IppJob job)
-    {
-        if (IppJobState.IsTerminal(job.GetState().State))
-        {
-            return false;
-        }
+    private static bool TryCancel(IppJob job) => job.Cancel();
 
-        if (job.Ticket != null)
-        {
-            return job.Ticket.Cancel();
-        }
+    private static string? SourceAddress(Call call) => call.Context.RemoteAddress?.MapToIPv6().ToString();
 
-        job.Terminate(IppJobState.Canceled, "job-canceled-by-user");
-        return true;
-    }
+    private static bool OwnsJob(Call call, IppJob job) =>
+        job.SourceAddress != null && job.SourceAddress == SourceAddress(call);
 
     private IppJob? FindJob(Call call)
     {
@@ -495,7 +497,7 @@ public class IppRequestHandler(
         }
 
         var job = id is int jobId ? _jobStore.Get(jobId) : null;
-        return job != null && job.PrinterSlug == call.Printer.Slug ? job : null;
+        return job != null && job.PrinterSlug == call.Printer.Slug && OwnsJob(call, job) ? job : null;
     }
 
     private static async Task<bool> HasMoreDataAsync(Stream body, CancellationToken ct)

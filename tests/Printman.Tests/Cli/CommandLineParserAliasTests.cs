@@ -402,8 +402,11 @@ public sealed class CommandLineParserAliasTests
         Assert.ThrowsExactly<ArgumentException>(() => CommandLineParser.Parse(["doc.pdf", "-bogus"]));
 
     [TestMethod]
-    public void Print_LeadingSlashArgument_IsRejected() =>
-        Assert.ThrowsExactly<ArgumentException>(() => CommandLineParser.Parse(["/tmp/report.pdf"]));
+    public void Print_LeadingSlashArgument_FollowsPlatformPathRules()
+    {
+        if (OperatingSystem.IsWindows()) Assert.ThrowsExactly<ArgumentException>(() => CommandLineParser.Parse(["/tmp/report.pdf"]));
+        else Assert.IsNotNull(CommandLineParser.Parse(["/tmp/report.pdf"]));
+    }
 
     [TestMethod]
     public void Print_NoFilePath_Throws() =>

@@ -225,7 +225,7 @@ public sealed class IppParseException(string message) : Exception(message);
 /// <param name="Body">Request body positioned at the start of the IPP message; the document follows the attributes.</param>
 /// <param name="PrinterSlug">Printer path segment from /ipp/print/{slug}, or null for the default shared printer.</param>
 /// <param name="Host">Host header as sent by the client (host[:port]); used to build printer and job URIs.</param>
-/// <param name="RemoteAddress">Client address, for logging.</param>
+/// <param name="RemoteAddress">Client transport address, used for anonymous job isolation.</param>
 public sealed record IppRequestContext(Stream Body, string? PrinterSlug, string Host, IPAddress? RemoteAddress);
 
 /// <summary>
@@ -248,6 +248,7 @@ public sealed record IppJobOptions
 public sealed class IppJob
 {
     private readonly object _sync = new();
+    private bool _receiving;
     private int? _overrideState;
     private string? _overrideReason;
     private DateTime? _overrideCompletedAt;
@@ -256,18 +257,56 @@ public sealed class IppJob
     public required string PrinterSlug { get; init; }
     public required string Name { get; init; }
     public required string UserName { get; init; }
+    public string? SourceAddress { get; init; }
     public IppJobOptions Options { get; init; } = new();
     public DateTime CreatedAt { get; } = DateTime.UtcNow;
     public PipelineTicket? Ticket { get; private set; }
     public string? DocumentFormat { get; private set; }
 
     /// <summary>True between Create-Job and the first Send-Document.</summary>
-    public bool AwaitingDocument => Ticket == null && _overrideState == null;
+    public bool AwaitingDocument
+    {
+        get { lock (_sync) return !_receiving && Ticket == null && _overrideState == null; }
+    }
+
+    public bool TryBeginDocument()
+    {
+        lock (_sync)
+        {
+            if (!AwaitingDocument) return false;
+            _receiving = true;
+            return true;
+        }
+    }
+
+    // Enqueue and attach share the cancellation lock, so a canceled upload cannot reach the printer.
+    public PipelineTicket? Submit(Func<PipelineTicket> enqueue, string documentFormat)
+    {
+        lock (_sync)
+        {
+            if (_overrideState != null || Ticket != null) return null;
+            Attach(enqueue(), documentFormat);
+            return Ticket;
+        }
+    }
+
+    public bool Cancel()
+    {
+        lock (_sync)
+        {
+            if (IppJobState.IsTerminal(GetState().State)) return false;
+            if (Ticket != null) return Ticket.Cancel();
+            Terminate(IppJobState.Canceled, "job-canceled-by-user");
+            return true;
+        }
+    }
 
     public void Attach(PipelineTicket ticket, string documentFormat)
     {
         lock (_sync)
         {
+            if (_overrideState != null || Ticket != null) return;
+            _receiving = false;
             Ticket = ticket;
             DocumentFormat = documentFormat;
         }
@@ -325,6 +364,7 @@ public sealed class IppServerSettings
     public int IppPort { get; set; } = ShareOptions.DefaultIppPort;
     public long MaxJobBytes { get; set; } = 256L * 1024 * 1024;
     public int MaxPendingJobs { get; set; } = 50;
+    public TimeSpan RequestTimeout { get; set; } = TimeSpan.FromMinutes(10);
 
     /// <summary>mDNS host name (e.g. "desktop-printman.local"), null when advertising is off.</summary>
     public string? MdnsHostName { get; set; }
