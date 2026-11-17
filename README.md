@@ -1,13 +1,13 @@
 # Printman 🖨️
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Zero Dependencies](https://img.shields.io/badge/Dependencies-None%20(Single%20Binary)-2ea44f)]()
+[![Windows Runtime](https://img.shields.io/badge/Windows-.NET%2010%20Runtimes-2ea44f)](#download)
 [![Privacy](https://img.shields.io/badge/Network-100%25%20Local%20%E2%80%A2%20No%20Cloud-blue)]()
 [![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20Linux%20%7C%20macOS%20%7C%20Raspberry%20Pi-0078D6)]()
-[![Download](https://img.shields.io/badge/Download-Latest%20Release-0078D6)](https://github.com/EslaMx7/printman/releases/latest)
+[![Download](https://img.shields.io/badge/Download-Windows%20x64%20Build-0078D6)](https://github.com/prgding/printman/actions/runs/43876054337/artifacts/14228889965)
 [![Buy Me a Coffee](https://img.shields.io/badge/Buy%20Me%20a%20Coffee-FFDD00?style=flat&logo=buy-me-a-coffee&logoColor=black)](https://buymeacoffee.com/eslamx7)
 
-Turn any USB printer into a **native Wi-Fi printer** for iPhone, iPad, Android, Windows, macOS, and Linux. Run one single executable on the computer your printer is plugged into—your printer immediately appears in every device's built-in print dialog with **no phone apps, no extra drivers, and no cloud accounts**.
+Turn any USB printer into a **native Wi-Fi printer** for iPhone, iPad, Android, Windows, macOS, and Linux. Run Printman on the computer your printer is plugged into—your printer immediately appears in every device's built-in print dialog with **no phone apps, no extra drivers, and no cloud accounts**.
 
 🌐 **Website:** [printman.eslamx.com](https://printman.eslamx.com) · 📖 **Guides:** [AirPrint & Mopria Setup](https://printman.eslamx.com/guides/share-usb-printer-airprint-mopria-windows) · 📝 **Changelog:** [printman.eslamx.com/changelog](https://printman.eslamx.com/changelog)
 
@@ -15,7 +15,7 @@ Turn any USB printer into a **native Wi-Fi printer** for iPhone, iPad, Android, 
 
 ## ⚡ Quick Start (60 Seconds)
 
-1. **[Download Printman](#📥-download)** for your OS (Windows, macOS, Linux, or Raspberry Pi). Make sure your USB printer already works on that computer.
+1. **[Download Printman](#download)** for Windows x64 and follow the runtime installation and extraction steps below. Make sure your USB printer already works on that computer.
 2. **Start sharing** from your terminal:
    ```bash
    # Windows
@@ -56,25 +56,30 @@ Printing sensitive documents (bills, IDs, school records) requires trust. Here i
 - **First-Run OS Warnings (Unsigned Binaries):** Printman is free open-source software without expensive corporate code-signing certificates, so your OS may warn you on first launch:
   - **Windows SmartScreen:** Click **More info** → **Run anyway**.
   - **macOS Gatekeeper:** Run `xattr -d com.apple.quarantine ./printman` once in Terminal.
-  - You can verify every download against the SHA-256 `checksums.txt` published with every release.
+  - Verify the Windows evaluation ZIP using the SHA-256 value in the [download instructions](#download).
 
 ---
 
-## 📥 Download
+## Download
 
-Grab the latest standalone binary from [**GitHub Releases**](https://github.com/EslaMx7/printman/releases/latest) (no .NET installation required, except the optional *Portable* zip):
+### Windows x64 security evaluation build
 
-| Platform | Direct Binary / Installer | Archive | Notes |
-| :--- | :--- | :--- | :--- |
-| **Windows (x64)** ⭐ | `printman-v*-win-x64.exe` | `.zip` | Standalone single-file executable for 64-bit Windows |
-| **Windows (ARM64)** | `printman-v*-win-arm64.exe` | `.zip` | Snapdragon X / Copilot+ ARM64 Windows PCs |
-| **Windows (Portable)** | — | `.zip` | ~6 MB lightweight build (requires .NET 10 Desktop Runtime) |
-| **macOS (Apple Silicon)** | `printman-v*-osx-arm64.dmg` / binary | `.tar.gz` | M1 / M2 / M3 / M4 Macs |
-| **macOS (Intel)** | `printman-v*-osx-x64.dmg` / binary | `.tar.gz` | Intel-based Macs |
-| **Linux (x86_64)** | `printman-v*-linux-x64` | `.tar.gz` | Standalone Linux x86_64 binary |
-| **Raspberry Pi (ARM64)** | `printman-v*-linux-arm64` | `.tar.gz` | Raspberry Pi 3 / 4 / 5 (64-bit OS) |
-| **Raspberry Pi (ARMv7)** | `printman-v*-linux-arm` | `.tar.gz` | Raspberry Pi 2 / 3 / 4 (32-bit OS) |
-| **Verification** | `checksums.txt` | — | SHA-256 hashes for every file in the release |
+This fork provides a Windows x64 build containing the enterprise IPP security fixes on `security/enterprise-ipp`. The package was built from commit `c06afb444acd91702628220acc807e3d49dd8e23`, and its Windows build and automated tests succeeded. [View the Windows test results](https://github.com/prgding/printman/actions/runs/43876054337/job/133329271157).
+
+1. Sign in to GitHub, then download the `publish` artifact as `publish.zip`. [Download Printman for Windows x64](https://github.com/prgding/printman/actions/runs/43876054337/artifacts/14228889965).
+2. On the Windows computer hosting the USB printer, install both **.NET Desktop Runtime 10 (Windows x64)** and **ASP.NET Core Runtime 10 (Windows x64)**. This build uses the installed runtimes. [Microsoft runtime downloads](https://dotnet.microsoft.com/en-us/download/dotnet/10.0).
+3. Extract the entire ZIP into one folder and keep `printman.exe` together with all accompanying files. Run commands from that folder.
+4. Follow the enterprise acceptance plan for IPP port **10631**, Windows native printer setup and physical USB printing. Windows service hosting remains a follow-up implementation task. [Windows security and acceptance plan](docs/enterprise-windows-security.md).
+
+The artifact is scheduled to expire on **2027-02-14 at 13:28 UTC**. If it has expired, select a successful `build-windows` job from a newer run for `security/enterprise-ipp`, then download that run's `publish` artifact. Each run identifies its source commit. [Build runs for this branch](https://github.com/prgding/printman/actions/workflows/build.yml?query=branch%3Asecurity%2Fenterprise-ipp).
+
+Verify this ZIP in PowerShell with `Get-FileHash .\publish.zip -Algorithm SHA256`. The expected SHA-256 for artifact `14228889965` is
+
+```text
+57e7186e1189f7a545a28df0077a13ed604b732ef93d08b79ee4e2d672ed2f8d
+```
+
+Other platforms and standalone packages can be built from this branch using the source build instructions below.
 
 <details>
 <summary><strong>OS Setup & Firewall Notes (Windows, Linux/Pi, macOS)</strong></summary>
