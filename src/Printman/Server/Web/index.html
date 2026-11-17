@@ -567,7 +567,6 @@
       spoolerJobs: [],
       currentPrinterStatus: null,
       isPrinting: false,
-      pin: null,
       authRequired: true,
       activeTab: 'queue'
     };
@@ -603,8 +602,6 @@
     function getHeaders(contentType) {
       const h = { 'X-Requested-With': 'Printman' };
       if (contentType) h['Content-Type'] = contentType;
-      const pin = state.pin || localStorage.getItem('printman_pin');
-      if (pin) h['X-Printer-Pin'] = pin;
       return h;
     }
 
@@ -616,14 +613,8 @@
 
       initDropZone();
 
-      // Check URL query param ?pin=
-      const urlPin = new URLSearchParams(window.location.search).get('pin');
-      if (urlPin) {
-        localStorage.setItem('printman_pin', urlPin);
-        state.pin = urlPin;
-      } else {
-        state.pin = localStorage.getItem('printman_pin');
-      }
+      localStorage.removeItem('printman_pin');
+      if (window.location.search) history.replaceState(null, '', window.location.pathname);
 
       await checkAuthAndInit();
     });
@@ -635,15 +626,6 @@
         state.authRequired = data.required;
 
         if (state.authRequired && !data.authenticated) {
-          if (state.pin) {
-            const ok = await submitPinVerification(state.pin);
-            if (ok) {
-              hidePinModal();
-              loadPrinters();
-              initSSE();
-              return;
-            }
-          }
           showPinModal();
           return;
         }
@@ -705,8 +687,8 @@
           return false;
         }
 
-        state.pin = pinToVerify;
-        localStorage.setItem('printman_pin', pinToVerify);
+        document.getElementById('pinInput').value = '';
+        localStorage.removeItem('printman_pin');
         return true;
       } catch (err) {
         pinError.textContent = 'Connection error: ' + err.message;
@@ -1140,9 +1122,11 @@
             </div>
           </div>
           <div class="spool-job-actions">
-            <button type="button" class="btn-cancel-job" onclick="cancelJob('${escapeHtml(j.printerName)}', '${cancelTargetId}', '${escapeHtml(j.documentName)}')" title="Cancel this print job">Cancel</button>
+            <button type="button" class="btn-cancel-job" title="Cancel this print job">Cancel</button>
           </div>
         `;
+        card.querySelector('.btn-cancel-job').addEventListener('click', () =>
+          cancelJob(j.printerName, cancelTargetId, j.documentName));
         spoolerJobsList.appendChild(card);
       });
     }
@@ -1297,9 +1281,7 @@
 
     // SSE (Server-Sent Events)
     function initSSE() {
-      const pin = state.pin || localStorage.getItem('printman_pin');
-      const url = pin ? `/api/events?pin=${encodeURIComponent(pin)}` : '/api/events';
-      const evtSource = new EventSource(url);
+      const evtSource = new EventSource('/api/events');
 
       evtSource.onopen = () => {
         connBadge.className = 'connection-badge connected';

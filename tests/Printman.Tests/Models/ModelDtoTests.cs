@@ -1,4 +1,3 @@
-using System.Drawing.Printing;
 using Printman.Core.Models;
 
 namespace Printman.Tests.Models;
@@ -321,7 +320,7 @@ public sealed class ModelDtoTests
         Assert.IsTrue(options.EnableWebUi);
         Assert.IsFalse(options.Share.Enabled);
         Assert.AreEqual(0, options.Share.Printers.Count);
-        Assert.AreEqual(631, options.Share.IppPort);
+        Assert.AreEqual(Printman.Core.Models.ShareOptions.DefaultIppPort, options.Share.IppPort);
         Assert.IsTrue(options.Share.EnableMdns);
         Assert.IsFalse(options.Share.AllowAnySource);
         Assert.AreEqual(256, options.Share.MaxJobMb);

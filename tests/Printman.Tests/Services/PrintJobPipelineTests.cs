@@ -212,7 +212,8 @@ public sealed class PrintJobPipelineTests
     {
         using var fx = new PipelineFixture();
         var cached = await fx.CacheFileAsync();
-        fx.Discovery.FindOverride = _ => TestData.Printer(printerName);
+        fx.Discovery.Printers.Clear();
+        fx.Discovery.Printers.Add(TestData.Printer(printerName));
         fx.Pipeline.OutputDirectory = fx.Temp.Path;
 
         PipelineTicket? ticket = null;
@@ -222,7 +223,7 @@ public sealed class PrintJobPipelineTests
             await ticket.Completion.WaitAsync(TimeSpan.FromSeconds(5));
         });
 
-        Assert.AreEqual(expectedExtension, Path.GetExtension(fx.PrintService.Requests.Single().OutputFilePath));
+        Assert.AreEqual(OperatingSystem.IsWindows() ? expectedExtension : ".pdf", Path.GetExtension(fx.PrintService.Requests.Single().OutputFilePath));
     }
 
     [TestMethod]
@@ -243,7 +244,7 @@ public sealed class PrintJobPipelineTests
 
         var output = fx.PrintService.Requests.Single().OutputFilePath;
         Assert.IsNotNull(output);
-        Assert.AreEqual(".prn", Path.GetExtension(output!));
+        Assert.AreEqual(OperatingSystem.IsWindows() ? ".prn" : ".pdf", Path.GetExtension(output!));
         var fileStem = Path.GetFileNameWithoutExtension(output!)!;
         // timestamp (19) + '_' + truncated 60-character base name
         Assert.AreEqual(80, fileStem.Length);
@@ -557,6 +558,49 @@ public sealed class PrintJobPipelineTests
         (Channel<PipelineTicket>)typeof(PrintJobPipeline)
             .GetField("_queue", BindingFlags.Instance | BindingFlags.NonPublic)!
             .GetValue(pipeline)!;
+
+    [TestMethod]
+    public async Task QueueBoundsAndShutdownReleaseAllReferences()
+    {
+        using var fx = new PipelineFixture();
+        var file = await fx.CacheFileAsync();
+        var batch = TestData.Batch("Fake Printer", TestData.Item(file.FileId));
+        for (int i = 0; i < PrintJobPipeline.MaxPendingBatches; i++)
+            Assert.AreEqual(PipelineJobState.Pending, fx.Pipeline.Enqueue(batch).State);
+        Assert.AreEqual(PipelineJobState.Failed, fx.Pipeline.Enqueue(batch).State);
+        Assert.AreEqual(PrintJobPipeline.MaxPendingBatches, fx.Pipeline.PendingCount);
+        Assert.IsFalse(fx.Cache.DeleteFile(file.FileId));
+        await fx.Pipeline.RunAsync(new CancellationToken(canceled: true));
+        Assert.IsNull(fx.Cache.GetFile(file.FileId));
+        Assert.AreEqual(0, fx.Pipeline.PendingCount);
+        Assert.AreEqual(PipelineJobState.Failed, fx.Pipeline.Enqueue(batch).State);
+    }
+
+    [TestMethod]
+    public void EmptyAndOversizedBatchesAreRejected()
+    {
+        using var fx = new PipelineFixture();
+        Assert.AreEqual(PipelineJobState.Failed, fx.Pipeline.Enqueue(new PipelineBatch { Items = [] }).State);
+        var batch = TestData.Batch("Fake Printer", Enumerable.Range(0, 51).Select(_ => TestData.Item()).ToArray());
+        Assert.AreEqual(PipelineJobState.Failed, fx.Pipeline.Enqueue(batch).State);
+        Assert.AreEqual(0, fx.Pipeline.PendingCount);
+    }
+
+    [TestMethod]
+    public async Task NetworkBatchDoesNotFuzzyMatchAnotherQueue()
+    {
+        using var fx = new PipelineFixture();
+        var cached = await fx.CacheFileAsync();
+        var ticket = fx.Pipeline.Enqueue(TestData.Batch("Fake", TestData.Item(cached.FileId)));
+        using var cts = new CancellationTokenSource();
+        var worker = fx.Pipeline.RunAsync(cts.Token);
+        await ticket.Completion.WaitAsync(TimeSpan.FromSeconds(5));
+        cts.Cancel();
+        await worker;
+        Assert.AreEqual(PipelineJobState.Failed, ticket.State);
+        Assert.AreEqual(0, fx.PrintService.Requests.Count);
+        Assert.IsNull(fx.Cache.GetFile(cached.FileId));
+    }
 
     private sealed class PipelineFixture : IDisposable
     {

@@ -1,13 +1,16 @@
 <Project Sdk="MSTest.Sdk/4.4.1">
 
   <PropertyGroup>
-    <TargetFramework>net10.0-windows</TargetFramework>
-    <TargetPlatformIdentifier>Windows</TargetPlatformIdentifier>
-    <TargetPlatformVersion>10.0.19041.0</TargetPlatformVersion>
-    <TargetPlatformMinVersion>10.0.17763.0</TargetPlatformMinVersion>
+    <PrintmanWindows Condition="'$(RuntimeIdentifier)' != ''">$([System.String]::Copy('$(RuntimeIdentifier)').StartsWith('win'))</PrintmanWindows>
+    <PrintmanWindows Condition="'$(RuntimeIdentifier)' == ''">$([MSBuild]::IsOSPlatform('Windows'))</PrintmanWindows>
+    <TargetFramework>net10.0</TargetFramework>
+    <TargetFramework Condition="'$(PrintmanWindows)' == 'true'">net10.0-windows</TargetFramework>
+    <TargetPlatformIdentifier Condition="'$(PrintmanWindows)' == 'true'">Windows</TargetPlatformIdentifier>
+    <TargetPlatformVersion Condition="'$(PrintmanWindows)' == 'true'">10.0.19041.0</TargetPlatformVersion>
+    <TargetPlatformMinVersion Condition="'$(PrintmanWindows)' == 'true'">10.0.17763.0</TargetPlatformMinVersion>
     <RootNamespace>Printman.Tests</RootNamespace>
     <AssemblyName>Printman.Tests</AssemblyName>
-    <UseWindowsForms>true</UseWindowsForms>
+    <UseWindowsForms Condition="'$(PrintmanWindows)' == 'true'">true</UseWindowsForms>
     <IsPackable>false</IsPackable>
   </PropertyGroup>
 

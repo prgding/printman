@@ -19,9 +19,10 @@ public class PrintJobPipeline(
     private readonly IPrintEventHub _eventHub = eventHub;
     private readonly IPrintQueueService _queueService = queueService;
 
-    private readonly Channel<PipelineTicket> _queue = Channel.CreateUnbounded<PipelineTicket>();
-    private readonly Dictionary<string, int> _queuedFileRefs = new(StringComparer.OrdinalIgnoreCase);
-    private readonly object _fileRefSync = new();
+    public const int MaxPendingBatches = 50;
+    public const int MaxBatchItems = 50;
+    private readonly Channel<PipelineTicket> _queue = Channel.CreateBounded<PipelineTicket>(
+        new BoundedChannelOptions(MaxPendingBatches) { FullMode = BoundedChannelFullMode.Wait });
     private int _pendingCount;
 
     public int PendingCount => Volatile.Read(ref _pendingCount);
@@ -31,6 +32,11 @@ public class PrintJobPipeline(
     public PipelineTicket Enqueue(PipelineBatch batch)
     {
         var ticket = new PipelineTicket(batch);
+        if (batch.Items.Count is < 1 or > MaxBatchItems)
+        {
+            ticket.Finish(PipelineJobState.Failed, "Invalid number of documents in batch.");
+            return ticket;
+        }
         TrackBatchFiles(batch);
         Interlocked.Increment(ref _pendingCount);
         if (!_queue.Writer.TryWrite(ticket))
@@ -68,6 +74,7 @@ public class PrintJobPipeline(
         catch (OperationCanceledException) { }
         finally
         {
+            _queue.Writer.TryComplete();
             // Release anything still waiting so callers observing tickets do not hang
             while (_queue.Reader.TryRead(out var leftover))
             {
@@ -93,7 +100,7 @@ public class PrintJobPipeline(
 
             var targetPrinterName = batch.Printer;
             var printer = !string.IsNullOrWhiteSpace(targetPrinterName)
-                ? _printerDiscovery.FindPrinter(targetPrinterName)
+                ? _printerDiscovery.GetPrinters().FirstOrDefault(p => string.Equals(p.Name, targetPrinterName, StringComparison.OrdinalIgnoreCase))
                 : _printerDiscovery.GetDefaultPrinter();
 
             if (printer == null)
@@ -296,13 +303,7 @@ public class PrintJobPipeline(
 
     private void TrackBatchFiles(PipelineBatch batch)
     {
-        lock (_fileRefSync)
-        {
-            foreach (var item in batch.Items)
-            {
-                _queuedFileRefs[item.FileId] = _queuedFileRefs.GetValueOrDefault(item.FileId) + 1;
-            }
-        }
+        foreach (var item in batch.Items) _fileCache.AddReference(item.FileId);
     }
 
     private void ReleaseBatchFiles(PipelineBatch batch, bool deleteIfUnused)
@@ -315,26 +316,7 @@ public class PrintJobPipeline(
 
     private void ReleaseFileRef(string fileId, bool deleteIfUnused)
     {
-        bool shouldDelete;
-        lock (_fileRefSync)
-        {
-            int count = _queuedFileRefs.GetValueOrDefault(fileId);
-            if (count <= 1)
-            {
-                _queuedFileRefs.Remove(fileId);
-                shouldDelete = deleteIfUnused;
-            }
-            else
-            {
-                _queuedFileRefs[fileId] = count - 1;
-                shouldDelete = false;
-            }
-        }
-
-        if (shouldDelete)
-        {
-            _fileCache.DeleteFile(fileId);
-        }
+        _fileCache.ReleaseReference(fileId, deleteIfUnused);
     }
 
     private string? BuildOutputFilePath(string printerName, string displayName)

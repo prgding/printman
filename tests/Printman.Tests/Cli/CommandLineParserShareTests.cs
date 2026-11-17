@@ -15,7 +15,7 @@ public sealed class CommandLineParserShareTests
         Assert.IsTrue(args.SharePrinters);
         Assert.IsFalse(args.EnableWebUi);
         Assert.AreEqual(0, args.SharedPrinterNames.Count);
-        Assert.AreEqual(631, args.IppPort);
+        Assert.AreEqual(Printman.Core.Models.ShareOptions.DefaultIppPort, args.IppPort);
         Assert.IsTrue(args.EnableMdns);
     }
 

@@ -543,7 +543,8 @@ public sealed class CommandLineParserTests
     public void Parse_Print_UnknownFlagOrSlashPath_Throws()
     {
         Assert.ThrowsExactly<ArgumentException>(() => CommandLineParser.Parse(["doc.pdf", "--bogus"]));
-        Assert.ThrowsExactly<ArgumentException>(() => CommandLineParser.Parse(["/tmp/doc.pdf"]));
+        if (OperatingSystem.IsWindows()) Assert.ThrowsExactly<ArgumentException>(() => CommandLineParser.Parse(["/tmp/doc.pdf"]));
+        else Assert.IsNotNull(CommandLineParser.Parse(["/tmp/doc.pdf"]));
     }
 
     // ---------------------------------------------------------------------
@@ -623,7 +624,7 @@ public sealed class CommandLineParserTests
         Assert.IsNull(options.OutputDirectory);
         Assert.IsTrue(options.EnableWebUi);
         Assert.IsFalse(options.Share.Enabled);
-        Assert.AreEqual(631, options.Share.IppPort);
+        Assert.AreEqual(Printman.Core.Models.ShareOptions.DefaultIppPort, options.Share.IppPort);
         Assert.IsTrue(options.Share.EnableMdns);
         Assert.IsFalse(options.Share.AllowAnySource);
     }

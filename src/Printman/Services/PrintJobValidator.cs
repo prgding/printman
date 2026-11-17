@@ -1,4 +1,5 @@
 ﻿using Printman.Core.Abstractions;
+using Printman.Services.Renderers;
 using Printman.Core.Models;
 
 namespace Printman.Services;
@@ -62,6 +63,11 @@ public class PrintJobValidator(
         if (totalPages <= 0)
         {
             return ValidationResult.Fail("The document does not contain any printable pages.");
+        }
+
+        if (totalPages > DocumentRenderLimits.MaxPages)
+        {
+            return ValidationResult.Fail($"Document exceeds the {DocumentRenderLimits.MaxPages}-page limit.");
         }
 
         var includedPages = request.PageRange.ResolvePages(totalPages);

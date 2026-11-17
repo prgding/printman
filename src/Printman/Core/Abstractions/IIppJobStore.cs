@@ -3,11 +3,11 @@ using Printman.Core.Models;
 namespace Printman.Core.Abstractions;
 
 /// <summary>
-/// In-memory registry of IPP jobs with monotonically increasing job ids.
+/// In-memory registry of IPP jobs with unpredictable positive job ids.
 /// </summary>
 public interface IIppJobStore
 {
-    IppJob Create(string printerSlug, string name, string userName, IppJobOptions options);
+    IppJob Create(string printerSlug, string name, string userName, IppJobOptions options, string? sourceAddress = null, int maxActiveJobs = 50);
     IppJob? Get(int jobId);
     IReadOnlyList<IppJob> List(string printerSlug);
 

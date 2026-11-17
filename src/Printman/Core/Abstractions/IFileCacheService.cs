@@ -47,6 +47,10 @@ public interface IFileCacheService
     /// </summary>
     bool DeleteFile(string fileId);
 
+    /// <summary>Protects a cached document against eviction until the caller releases it.</summary>
+    bool AddReference(string fileId);
+    void ReleaseReference(string fileId, bool deleteIfUnused);
+
     /// <summary>
     /// Deletes all cached and temporary files in the cache directory (best-effort).
     /// </summary>

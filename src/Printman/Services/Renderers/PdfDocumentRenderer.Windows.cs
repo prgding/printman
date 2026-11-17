@@ -13,6 +13,7 @@ public partial class PdfDocumentRenderer : IGdiDocumentRenderer
         var fullPath = Path.GetFullPath(filePath);
         var storageFile = await StorageFile.GetFileFromPathAsync(fullPath);
         var pdfDoc = await PdfDocument.LoadFromFileAsync(storageFile);
+        DocumentRenderLimits.ValidatePageCount(pdfDoc.PageCount);
         return (int)pdfDoc.PageCount;
     }
 
@@ -27,6 +28,7 @@ public partial class PdfDocumentRenderer : IGdiDocumentRenderer
         var fullPath = Path.GetFullPath(filePath);
         var storageFile = await StorageFile.GetFileFromPathAsync(fullPath);
         var pdfDoc = await PdfDocument.LoadFromFileAsync(storageFile);
+        DocumentRenderLimits.ValidatePageCount(pdfDoc.PageCount);
 
         if (pageNumber < 1 || pageNumber > pdfDoc.PageCount)
         {
@@ -39,8 +41,11 @@ public partial class PdfDocumentRenderer : IGdiDocumentRenderer
         // PDF coordinate space is in points (72 points per inch)
         // High quality rendering: scale to target DPI (default 300 DPI)
         double scale = (dpi > 0 ? dpi : 300) / 72.0;
-        uint destWidth = (uint)Math.Max(1, Math.Round(page.Size.Width * scale));
-        uint destHeight = (uint)Math.Max(1, Math.Round(page.Size.Height * scale));
+        double width = Math.Max(1, Math.Round(page.Size.Width * scale));
+        double height = Math.Max(1, Math.Round(page.Size.Height * scale));
+        DocumentRenderLimits.ValidateDimensions(width, height);
+        uint destWidth = (uint)width;
+        uint destHeight = (uint)height;
 
         var renderOptions = new PdfPageRenderOptions
         {

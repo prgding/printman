@@ -9,7 +9,7 @@ namespace Printman.Tests.Services;
 public sealed class IppJobStoreTests
 {
     [TestMethod]
-    public void Create_AssignsMonotonicallyIncreasingIds()
+    public void Create_AssignsDistinctPositiveIds()
     {
         var store = new IppJobStore();
 
@@ -17,9 +17,8 @@ public sealed class IppJobStoreTests
         var second = store.Create("printer", "job-2", "bob", new IppJobOptions());
         var third = store.Create("printer", "job-3", "carol", new IppJobOptions());
 
-        Assert.AreEqual(1, first.Id);
-        Assert.AreEqual(2, second.Id);
-        Assert.AreEqual(3, third.Id);
+        Assert.IsTrue(first.Id > 0 && second.Id > 0 && third.Id > 0);
+        Assert.AreEqual(3, new[] { first.Id, second.Id, third.Id }.Distinct().Count());
     }
 
     [TestMethod]
@@ -48,7 +47,7 @@ public sealed class IppJobStoreTests
     }
 
     [TestMethod]
-    public void List_FiltersByPrinterAndOrdersById()
+    public void List_FiltersByPrinterAndOrdersByCreation()
     {
         var store = new IppJobStore();
         var first = store.Create("a", "job", "alice", new IppJobOptions());
@@ -180,14 +179,16 @@ public sealed class IppJobStoreTests
     public void Sweep_RemovesOldestFinishedBeyondLimit()
     {
         var store = new IppJobStore();
+        var jobs = new List<IppJob>();
         for (int i = 0; i < 101; i++)
         {
-            store.Create("a", "job", "alice", new IppJobOptions()).Terminate(IppJobState.Completed, "done");
+            var job = store.Create("a", "job", "alice", new IppJobOptions());
+            job.Terminate(IppJobState.Completed, "done");
+            jobs.Add(job);
         }
 
-        // First access sweeps the oldest finished job (id 1) out of the retained window.
-        Assert.IsNotNull(store.Get(101));
-        Assert.IsNull(store.Get(1));
+        Assert.IsNotNull(store.Get(jobs[^1].Id));
+        Assert.IsNull(store.Get(jobs[0].Id));
         Assert.AreEqual(100, store.List("a").Count);
     }
 
@@ -215,6 +216,36 @@ public sealed class IppJobStoreTests
         var state = job.GetState();
         Assert.AreEqual(IppJobState.Aborted, state.State);
         Assert.AreEqual("aborted-by-system", state.Reason);
+    }
+
+    [TestMethod]
+    public void AdmissionIsAtomicAcrossPrintersAndExpiredJobsReleaseCapacity()
+    {
+        var store = new IppJobStore();
+        var admitted = new System.Collections.Concurrent.ConcurrentBag<IppJob>();
+        Parallel.For(0, 100, i =>
+        {
+            try { admitted.Add(store.Create("printer-" + i, "job", "user", new IppJobOptions(), maxActiveJobs: 5)); }
+            catch (IppQueueFullException) { }
+        });
+        Assert.AreEqual(5, admitted.Count);
+        foreach (var job in admitted) SetField(job, "<CreatedAt>k__BackingField", DateTime.UtcNow.AddMinutes(-2));
+        Assert.AreEqual(0, store.ActiveCount(admitted.First().PrinterSlug));
+        Assert.IsNotNull(store.Create("printer", "next", "user", new IppJobOptions(), maxActiveJobs: 5));
+    }
+
+    [TestMethod]
+    public void ReceivingJobCannotBeClaimedTwiceOrSubmittedAfterCancellation()
+    {
+        var job = new IppJobStore().Create("printer", "job", "user", new IppJobOptions());
+        Assert.IsTrue(job.TryBeginDocument());
+        Assert.IsFalse(job.TryBeginDocument());
+        Assert.IsFalse(job.AwaitingDocument);
+        Assert.IsTrue(job.Cancel());
+        Assert.IsFalse(job.Cancel());
+        Assert.IsNull(job.Submit(() => throw new AssertFailedException("Canceled job was enqueued"), "application/pdf"));
+        job.Attach(new PipelineTicket(TestData.Batch()), "application/pdf");
+        Assert.IsNull(job.Ticket);
     }
 
     private static void SetField(object target, string fieldName, object value) =>

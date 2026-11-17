@@ -19,8 +19,7 @@ public sealed record RasterPage(long DataOffset, int Width, int Height, int Bits
 /// </summary>
 public abstract partial class RasterDocumentRenderer : IDocumentRenderer
 {
-    private const int MaxDimension = 20000;
-    private const long MaxPageBytes = 300L * 1024 * 1024;
+    private readonly object _indexSync = new();
 
     private readonly ConcurrentDictionary<string, (long Length, DateTime Modified, IReadOnlyList<RasterPage> Pages)> _index =
         new(StringComparer.OrdinalIgnoreCase);
@@ -47,7 +46,11 @@ public abstract partial class RasterDocumentRenderer : IDocumentRenderer
             throw new InvalidDataException("Raster document contains no pages.");
         }
 
-        _index[filePath] = (info.Length, info.LastWriteTimeUtc, pages);
+        lock (_indexSync)
+        {
+            if (_index.Count >= 64) _index.Clear();
+            _index[filePath] = (info.Length, info.LastWriteTimeUtc, pages);
+        }
         return pages;
     }
 
@@ -58,21 +61,13 @@ public abstract partial class RasterDocumentRenderer : IDocumentRenderer
 
     protected static RasterPage CreatePage(long offset, int width, int height, int bitsPerPixel, RasterColorSpace colorSpace, int dpi)
     {
-        if (width <= 0 || height <= 0 || width > MaxDimension || height > MaxDimension)
-        {
-            throw new InvalidDataException($"Unsupported raster page size {width}x{height}.");
-        }
+        DocumentRenderLimits.ValidateDimensions(width, height);
 
         bool supported = (bitsPerPixel == 8 && colorSpace != RasterColorSpace.Rgb) ||
                          (bitsPerPixel == 24 && colorSpace == RasterColorSpace.Rgb);
         if (!supported)
         {
             throw new NotSupportedException($"Unsupported raster pixel format ({bitsPerPixel} bpp, {colorSpace}).");
-        }
-
-        if ((long)width * height * 3 > MaxPageBytes)
-        {
-            throw new InvalidDataException("Raster page is too large.");
         }
 
         return new RasterPage(offset, width, height, bitsPerPixel, colorSpace, dpi);

@@ -344,7 +344,7 @@ public sealed class IppModelTests
 
         Assert.AreEqual(5000, settings.WebPort);
         Assert.IsTrue(settings.WebUiEnabled);
-        Assert.AreEqual(631, settings.IppPort);
+        Assert.AreEqual(Printman.Core.Models.ShareOptions.DefaultIppPort, settings.IppPort);
         Assert.AreEqual(256L * 1024 * 1024, settings.MaxJobBytes);
         Assert.AreEqual(50, settings.MaxPendingJobs);
         Assert.IsNull(settings.MdnsHostName);

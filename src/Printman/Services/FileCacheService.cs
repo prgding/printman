@@ -1,5 +1,5 @@
-using System.Collections.Concurrent;
 using System.Security.Cryptography;
+using System.Text;
 using Printman.Core.Abstractions;
 using Printman.Core.Models;
 
@@ -10,296 +10,252 @@ public class FileCacheService : IFileCacheService
     private static readonly HashSet<string> AllowedExtensions = new(StringComparer.OrdinalIgnoreCase)
     {
         ".pdf", ".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".tif", ".txt", ".log", ".csv", ".json", ".md",
-        ".pwg", ".urf" // PWG / Apple raster from network (IPP) clients
+        ".pwg", ".urf"
     };
 
     private readonly string _cacheDirectory;
-    private readonly ConcurrentDictionary<string, FileCacheResult> _cacheIndex = new(StringComparer.OrdinalIgnoreCase);
+    private readonly object _sync = new();
+    private readonly Dictionary<string, FileCacheResult> _cacheIndex = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, int> _references = new(StringComparer.OrdinalIgnoreCase);
+    private readonly HashSet<string> _uploads = new(StringComparer.OrdinalIgnoreCase);
+    private readonly SemaphoreSlim _uploadSlots = new(4);
+    private long _reservedBytes;
 
     public string CacheDirectory => _cacheDirectory;
-    public long MaxFileSizeBytes { get; set; } = 50L * 1024 * 1024; // 50 MB default
-    public long MaxCacheSizeBytes { get; set; } = 500L * 1024 * 1024; // 500 MB default
+    public long MaxFileSizeBytes { get; set; } = 50L * 1024 * 1024;
+    public long MaxCacheSizeBytes { get; set; } = 500L * 1024 * 1024;
     public bool Deduplicate { get; set; } = true;
 
-    /// <param name="cacheDirectory">
-    /// Directory used for cached uploads. Defaults to <see cref="DefaultCacheDirectory"/> for this OS;
-    /// tests inject a temporary directory to stay isolated.
-    /// </param>
     public FileCacheService(string? cacheDirectory = null)
     {
-        _cacheDirectory = cacheDirectory ?? DefaultCacheDirectory(
-            OperatingSystem.IsWindows(),
-            AppContext.BaseDirectory,
+        _cacheDirectory = Path.GetFullPath(cacheDirectory ?? DefaultCacheDirectory(
+            OperatingSystem.IsWindows(), AppContext.BaseDirectory,
             Environment.GetEnvironmentVariable("XDG_CACHE_HOME"),
-            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile));
-        if (!Directory.Exists(_cacheDirectory))
+            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile)));
+        Directory.CreateDirectory(_cacheDirectory);
+        EnsureCacheDirectory();
+        foreach (var path in Directory.GetFiles(_cacheDirectory))
         {
-            Directory.CreateDirectory(_cacheDirectory);
+            if (IsTemporaryFile(path)) TryDeleteFile(path);
         }
-
-        // Index existing files on startup
-        IndexExistingFiles();
     }
 
-    /// <summary>
-    /// Windows: "cache" next to the executable (portable zip installs). Linux / macOS: install folders such as
-    /// /usr/local/bin are read-only, so $XDG_CACHE_HOME/printman (default ~/.cache/printman) is used.
-    /// </summary>
     public static string DefaultCacheDirectory(bool windows, string baseDirectory, string? xdgCacheHome, string userProfile)
     {
-        if (windows)
-        {
-            return Path.Combine(baseDirectory, "cache");
-        }
-
+        if (windows) return Path.Combine(baseDirectory, "cache");
         var root = !string.IsNullOrWhiteSpace(xdgCacheHome) && Path.IsPathRooted(xdgCacheHome)
-            ? xdgCacheHome
-            : Path.Combine(userProfile, ".cache");
+            ? xdgCacheHome : Path.Combine(userProfile, ".cache");
         return Path.Combine(root, "printman");
     }
+
+    // Accept the original 16-hex cache identifiers as well as new random/hash identifiers.
+    public static bool IsValidFileId(string? fileId) =>
+        fileId is { Length: 16 or 32 or 64 } && fileId.All(char.IsAsciiHexDigit);
 
     public Task<FileCacheResult> StoreFileAsync(string originalFileName, Stream contentStream, CancellationToken ct = default) =>
         StoreFileAsync(originalFileName, contentStream, MaxFileSizeBytes, ct);
 
     public async Task<FileCacheResult> StoreFileAsync(string originalFileName, Stream contentStream, long maxFileSizeBytes, CancellationToken ct = default)
     {
-        var sanitizedExt = Path.GetExtension(originalFileName).ToLowerInvariant();
-        if (string.IsNullOrWhiteSpace(sanitizedExt) || !AllowedExtensions.Contains(sanitizedExt))
-        {
-            throw new ArgumentException($"File extension '{sanitizedExt}' is not supported for printing.");
-        }
+        var extension = Path.GetExtension(originalFileName).ToLowerInvariant();
+        if (!AllowedExtensions.Contains(extension))
+            throw new ArgumentException($"File extension '{extension}' is not supported for printing.");
+        if (!await _uploadSlots.WaitAsync(0, ct))
+            throw new InvalidOperationException("Too many concurrent uploads. Try again later.");
 
-        // Proactively evict old files if cache exceeds quota
-        await CleanupOldFilesAsync(ct);
-
-        var tempFilePath = Path.Combine(_cacheDirectory, $"tmp_{Guid.NewGuid():N}.tmp");
-
-        string fileHash;
-        long totalBytesWritten = 0;
-
+        var tempPath = Path.Combine(_cacheDirectory, $"tmp_{Guid.NewGuid():N}.tmp");
+        long reserved = 0;
         try
         {
-            using (var tempFileStream = new FileStream(tempFilePath, FileMode.Create, FileAccess.Write, FileShare.None, 81920, useAsync: true))
+            lock (_sync)
+            {
+                EnsureCacheDirectory();
+                _uploads.Add(tempPath);
+            }
+            string hash;
+            using (var output = new FileStream(tempPath, FileMode.CreateNew, FileAccess.Write, FileShare.None, 81920, useAsync: true))
             using (var sha = IncrementalHash.CreateHash(HashAlgorithmName.SHA256))
             {
+                // Bind the identifier to the format as well as the bytes.
+                sha.AppendData(Encoding.UTF8.GetBytes(extension + "\0"));
                 var buffer = new byte[81920];
-                int bytesRead;
-
-                while ((bytesRead = await contentStream.ReadAsync(buffer, ct)) > 0)
+                int count;
+                while ((count = await contentStream.ReadAsync(buffer, ct)) > 0)
                 {
-                    totalBytesWritten += bytesRead;
-                    if (totalBytesWritten > maxFileSizeBytes)
+                    if (reserved + count > maxFileSizeBytes)
+                        throw new InvalidOperationException("Uploaded file exceeds the maximum allowed size.");
+                    lock (_sync)
                     {
-                        throw new InvalidOperationException($"Uploaded file exceeds the maximum allowed size of {maxFileSizeBytes / (1024 * 1024)} MB.");
+                        EnsureCapacity(count);
+                        reserved += count;
+                        _reservedBytes += count;
                     }
-
-                    await tempFileStream.WriteAsync(buffer.AsMemory(0, bytesRead), ct);
-                    sha.AppendData(buffer, 0, bytesRead);
+                    await output.WriteAsync(buffer.AsMemory(0, count), ct);
+                    sha.AppendData(buffer, 0, count);
                 }
-
-                fileHash = Convert.ToHexString(sha.GetHashAndReset()).ToLowerInvariant()[..16]; // 16-char fast compact hash
+                hash = Convert.ToHexString(sha.GetHashAndReset()).ToLowerInvariant();
             }
 
-            var fileId = Deduplicate ? fileHash : Guid.NewGuid().ToString("N")[..16];
-            var cachedFileName = $"{fileId}{sanitizedExt}";
-            var cachedFilePath = Path.Combine(_cacheDirectory, cachedFileName);
-
-            bool isDuplicate = false;
-
-            if (File.Exists(cachedFilePath))
+            lock (_sync)
             {
-                // File already cached with this hash! Deduplicate by deleting the temp file
-                isDuplicate = true;
-                try { File.Delete(tempFilePath); } catch { }
+                EnsureCacheDirectory();
+                var id = Deduplicate ? hash : Guid.NewGuid().ToString("N");
+                var path = Path.Combine(_cacheDirectory, id + extension);
+                bool duplicate = File.Exists(path);
+                if (duplicate && !IsRegularFile(path))
+                    throw new IOException("Cache destination is not a regular file.");
+                if (duplicate) File.Delete(tempPath);
+                else File.Move(tempPath, path);
+                var result = new FileCacheResult(id, Path.GetFileName(originalFileName), path, reserved, duplicate, extension);
+                _cacheIndex[id] = result;
+                return result;
             }
-            else
-            {
-                // Move temp file to final cached file path
-                File.Move(tempFilePath, cachedFilePath, overwrite: true);
-            }
-
-            var result = new FileCacheResult(
-                FileId: fileId,
-                OriginalFileName: originalFileName,
-                CachedFilePath: cachedFilePath,
-                FileSizeBytes: totalBytesWritten,
-                IsDuplicate: isDuplicate,
-                Extension: sanitizedExt);
-
-            _cacheIndex[fileId] = result;
-            return result;
         }
-        catch
+        finally
         {
-            // Clean up temporary file on failure
-            if (File.Exists(tempFilePath))
+            lock (_sync)
             {
-                try { File.Delete(tempFilePath); } catch { }
+                TryDeleteFile(tempPath);
+                _uploads.Remove(tempPath);
+                _reservedBytes -= reserved;
             }
-            throw;
+            _uploadSlots.Release();
         }
     }
 
     public FileCacheResult? GetFile(string fileId)
     {
-        if (_cacheIndex.TryGetValue(fileId, out var cached) && File.Exists(cached.CachedFilePath))
+        if (!IsValidFileId(fileId) || !Directory.Exists(_cacheDirectory)) return null;
+        lock (_sync)
         {
-            return cached;
-        }
-
-        // Check filesystem fallback
-        var matches = Directory.GetFiles(_cacheDirectory, $"{fileId}.*");
-        if (matches.Length > 0)
-        {
+            EnsureCacheDirectory();
+            if (_cacheIndex.TryGetValue(fileId, out var cached) && IsRegularFile(cached.CachedFilePath)) return cached;
+            // Never interpolate an unvalidated value into a filesystem search pattern.
+            var matches = Directory.GetFiles(_cacheDirectory)
+                .Where(p => IsCacheFile(p) && string.Equals(Path.GetFileNameWithoutExtension(p), fileId, StringComparison.OrdinalIgnoreCase))
+                .Take(2).ToArray();
+            if (matches.Length != 1) return null; // Ambiguous legacy identifiers must be re-uploaded.
             var path = matches[0];
-            var fi = new FileInfo(path);
-            var result = new FileCacheResult(
-                FileId: fileId,
-                OriginalFileName: Path.GetFileName(path),
-                CachedFilePath: path,
-                FileSizeBytes: fi.Length,
-                IsDuplicate: false,
-                Extension: Path.GetExtension(path).ToLowerInvariant());
-
+            var result = new FileCacheResult(fileId, Path.GetFileName(path), path,
+                new FileInfo(path).Length, false, Path.GetExtension(path).ToLowerInvariant());
             _cacheIndex[fileId] = result;
             return result;
         }
+    }
 
-        return null;
+    public bool AddReference(string fileId)
+    {
+        lock (_sync)
+        {
+            if (GetFile(fileId) == null) return false;
+            _references[fileId] = _references.GetValueOrDefault(fileId) + 1;
+            return true;
+        }
+    }
+
+    public void ReleaseReference(string fileId, bool deleteIfUnused)
+    {
+        lock (_sync)
+        {
+            int count = _references.GetValueOrDefault(fileId);
+            if (count == 0) return;
+            if (count > 1) _references[fileId] = count - 1;
+            else
+            {
+                _references.Remove(fileId);
+                if (deleteIfUnused) DeleteFile(fileId);
+            }
+        }
     }
 
     public bool DeleteFile(string fileId)
     {
-        if (string.IsNullOrWhiteSpace(fileId))
+        if (!IsValidFileId(fileId) || !Directory.Exists(_cacheDirectory)) return false;
+        lock (_sync)
         {
-            return false;
-        }
-
-        bool removed = false;
-        if (_cacheIndex.TryRemove(fileId, out var cached))
-        {
-            removed |= TryDeleteFile(cached.CachedFilePath);
-        }
-
-        try
-        {
-            foreach (var path in Directory.GetFiles(_cacheDirectory, $"{fileId}.*"))
-            {
+            if (_references.ContainsKey(fileId)) return false;
+            EnsureCacheDirectory();
+            bool removed = false;
+            foreach (var path in Directory.GetFiles(_cacheDirectory).Where(p => IsCacheFile(p) &&
+                string.Equals(Path.GetFileNameWithoutExtension(p), fileId, StringComparison.OrdinalIgnoreCase)))
                 removed |= TryDeleteFile(path);
-            }
+            if (removed) _cacheIndex.Remove(fileId);
+            return removed;
         }
-        catch
-        {
-            // Best effort if cache directory is unavailable
-        }
-
-        return removed;
     }
 
     public void ClearCache()
     {
-        _cacheIndex.Clear();
-        if (!Directory.Exists(_cacheDirectory))
+        lock (_sync)
         {
-            return;
-        }
-
-        foreach (var filePath in Directory.GetFiles(_cacheDirectory))
-        {
-            TryDeleteFile(filePath);
+            if (!Directory.Exists(_cacheDirectory)) return;
+            EnsureCacheDirectory();
+            foreach (var path in Directory.GetFiles(_cacheDirectory))
+            {
+                var id = Path.GetFileNameWithoutExtension(path);
+                if (!_uploads.Contains(path) && !_references.ContainsKey(id) && (IsCacheFile(path) || IsTemporaryFile(path)))
+                {
+                    if (TryDeleteFile(path)) _cacheIndex.Remove(id);
+                }
+            }
         }
     }
+
+    public Task CleanupOldFilesAsync(CancellationToken ct = default) => Task.Run(() =>
+    {
+        lock (_sync)
+        {
+            if (Directory.Exists(_cacheDirectory)) EnsureCapacity(0, cleanup: true);
+        }
+    }, ct);
+
+    private void EnsureCapacity(long additionalBytes, bool cleanup = false)
+    {
+        EnsureCacheDirectory();
+        var files = new DirectoryInfo(_cacheDirectory).GetFiles().Where(f => !_uploads.Contains(f.FullName)).ToList();
+        long total = files.Sum(f => f.Length) + _reservedBytes + additionalBytes;
+        if (total <= MaxCacheSizeBytes) return;
+        long target = cleanup ? (long)(MaxCacheSizeBytes * 0.8) : MaxCacheSizeBytes;
+        foreach (var file in files.OrderBy(f => f.LastAccessTimeUtc))
+        {
+            var id = Path.GetFileNameWithoutExtension(file.Name);
+            if (_references.ContainsKey(id) || !IsCacheFile(file.FullName)) continue;
+            long length = file.Length;
+            if (TryDeleteFile(file.FullName))
+            {
+                total -= length;
+                _cacheIndex.Remove(id);
+            }
+            if (total <= target) return;
+        }
+        if (!cleanup && total > MaxCacheSizeBytes)
+            throw new InvalidOperationException("Print cache is full. Try again after queued jobs finish.");
+    }
+
+    private void EnsureCacheDirectory()
+    {
+        if ((File.GetAttributes(_cacheDirectory) & FileAttributes.ReparsePoint) != 0)
+            throw new IOException("The cache directory must not be a symbolic link or junction.");
+    }
+
+    private static bool IsRegularFile(string path) => File.Exists(path) &&
+        (File.GetAttributes(path) & (FileAttributes.ReparsePoint | FileAttributes.Directory)) == 0;
+
+    private static bool IsCacheFile(string path) => IsValidFileId(Path.GetFileNameWithoutExtension(path)) &&
+        AllowedExtensions.Contains(Path.GetExtension(path)) && IsRegularFile(path);
+
+    private static bool IsTemporaryFile(string path) => Path.GetFileName(path).StartsWith("tmp_", StringComparison.Ordinal) &&
+        Path.GetExtension(path) == ".tmp" && IsRegularFile(path);
 
     private static bool TryDeleteFile(string path)
     {
         try
         {
-            if (!File.Exists(path))
-            {
-                return false;
-            }
-
+            if (!IsRegularFile(path)) return false;
             File.Delete(path);
             return true;
         }
-        catch
-        {
-            return false;
-        }
-    }
-
-    private void IndexExistingFiles()
-    {
-        try
-        {
-            foreach (var filePath in Directory.GetFiles(_cacheDirectory))
-            {
-                var fileName = Path.GetFileName(filePath);
-                if (fileName.StartsWith("tmp_") && fileName.EndsWith(".tmp"))
-                {
-                    // Clean up abandoned temp files from previous runs
-                    try { File.Delete(filePath); } catch { }
-                    continue;
-                }
-
-                var fileId = Path.GetFileNameWithoutExtension(filePath);
-                var fi = new FileInfo(filePath);
-                var result = new FileCacheResult(
-                    FileId: fileId,
-                    OriginalFileName: fileName,
-                    CachedFilePath: filePath,
-                    FileSizeBytes: fi.Length,
-                    IsDuplicate: false,
-                    Extension: Path.GetExtension(filePath).ToLowerInvariant());
-
-                _cacheIndex[fileId] = result;
-            }
-        }
-        catch
-        {
-            // Ignore directory scanning errors on startup
-        }
-    }
-
-    public Task CleanupOldFilesAsync(CancellationToken ct = default)
-    {
-        return Task.Run(() =>
-        {
-            try
-            {
-                var dirInfo = new DirectoryInfo(_cacheDirectory);
-                if (!dirInfo.Exists) return;
-
-                var files = dirInfo.GetFiles()
-                    .Where(f => !f.Name.StartsWith("tmp_"))
-                    .OrderBy(f => f.LastAccessTimeUtc)
-                    .ToList();
-
-                long totalSize = files.Sum(f => f.Length);
-                if (totalSize <= MaxCacheSizeBytes) return;
-
-                long targetSize = (long)(MaxCacheSizeBytes * 0.8);
-                foreach (var file in files)
-                {
-                    if (totalSize <= targetSize || ct.IsCancellationRequested) break;
-                    try
-                    {
-                        var len = file.Length;
-                        var id = Path.GetFileNameWithoutExtension(file.Name);
-                        file.Delete();
-                        totalSize -= len;
-                        _cacheIndex.TryRemove(id, out _);
-                    }
-                    catch
-                    {
-                        // Ignore files currently locked by active printing
-                    }
-                }
-            }
-            catch
-            {
-                // Best effort cache quota cleanup
-            }
-        }, ct);
+        catch (IOException) { return false; }
+        catch (UnauthorizedAccessException) { return false; }
     }
 }

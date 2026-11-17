@@ -1,4 +1,3 @@
-using System.Collections.Concurrent;
 using System.Net;
 using System.Net.NetworkInformation;
 using System.Net.Sockets;
@@ -13,6 +12,7 @@ using Microsoft.Extensions.Logging;
 using Printman.Core.Abstractions;
 using Printman.Core.Models;
 using Printman.Interactive;
+using Printman.Services;
 
 namespace Printman.Server;
 
@@ -94,7 +94,7 @@ public class PrintingWebServerHost(
             pin = RandomNumberGenerator.GetString("0123456789", 6);
         }
 
-        var activeSessions = new ConcurrentDictionary<string, DateTime>(StringComparer.Ordinal);
+        var sessions = new WebSessionSecurity(pin ?? "");
         var lanIps = GetLocalLanIpv4Addresses();
 
         // 3. Network printer sharing (IPP Everywhere / AirPrint / Mopria) - opt-in
@@ -116,10 +116,10 @@ public class PrintingWebServerHost(
             else
             {
                 sharing = true;
-                if (ippPort != port && !IsTcpPortAvailable(bindAddress, ippPort))
+                if (!IsTcpPortAvailable(bindAddress, ippPort))
                 {
-                    shareWarnings.Add($"IPP port {ippPort} is already in use; serving network printing on port {port} instead.");
-                    ippPort = port;
+                    ConsoleUi.PrintError($"IPP port {ippPort} is unavailable. Choose a free --ipp-port explicitly.");
+                    return 1;
                 }
 
                 _ippSettings.WebUiEnabled = webUi;
@@ -165,10 +165,12 @@ public class PrintingWebServerHost(
             {
                 kestrel.Listen(IPAddress.Parse(bindAddress), ippPort);
             }
+            kestrel.Limits.MaxConcurrentConnections = 100;
+            kestrel.Limits.RequestHeadersTimeout = TimeSpan.FromSeconds(30);
             kestrel.Limits.MaxRequestBodySize = maxUploadMb * 1024L * 1024L;
         });
 
-        var app = builder.Build();
+        await using var app = builder.Build();
 
         // 3. Serialized Print Queue (sec-06)
         using var queueCts = CancellationTokenSource.CreateLinkedTokenSource(ct, app.Lifetime.ApplicationStopping);
@@ -179,11 +181,11 @@ public class PrintingWebServerHost(
         {
             int lastJobCount = -1;
             string lastStatusSummary = "";
-            while (webUi && !ct.IsCancellationRequested)
+            while (webUi && !queueCts.IsCancellationRequested)
             {
                 try
                 {
-                    await Task.Delay(1500, ct);
+                    await Task.Delay(1500, queueCts.Token);
 
                     var jobs = _queueService.GetJobs();
                     int currentCount = jobs.Count;
@@ -207,76 +209,31 @@ public class PrintingWebServerHost(
             }
         }, ct);
 
-        // Authentication and CSRF helper checks (sec-01, sec-04)
-        bool IsRequestAuthenticated(HttpRequest req)
+        bool IsRequestAuthenticated(HttpRequest req) => !requireAuth || sessions.IsAuthenticated(req);
+
+        PrinterInfo? FindLocalPrinter(string? name) => _printerDiscovery.GetPrinters().FirstOrDefault(p =>
+            !p.Name.StartsWith(@"\\", StringComparison.Ordinal) &&
+            (string.IsNullOrWhiteSpace(name) ? p.IsDefault : string.Equals(p.Name, name, StringComparison.OrdinalIgnoreCase)));
+
+        // Reject arbitrary Host names before origin comparisons (including DNS rebinding).
+        app.Use(async (ctx, next) =>
         {
-            if (!requireAuth) return true;
-
-            // Check header PIN
-            if (req.Headers.TryGetValue("X-Printer-Pin", out var hPin) &&
-                string.Equals(hPin.ToString().Trim(), pin, StringComparison.Ordinal))
+            string host = ctx.Request.Host.Host;
+            bool knownHost = host.Equals("localhost", StringComparison.OrdinalIgnoreCase) ||
+                host.Equals(Environment.MachineName, StringComparison.OrdinalIgnoreCase) ||
+                host.Equals(_ippSettings.MdnsHostName, StringComparison.OrdinalIgnoreCase) ||
+                lanIps.Contains(host, StringComparer.OrdinalIgnoreCase) ||
+                host == ctx.Connection.LocalIpAddress?.ToString();
+            if (!knownHost)
             {
-                return true;
+                ctx.Response.StatusCode = StatusCodes.Status400BadRequest;
+                return;
             }
-
-            // Check header auth token
-            if (req.Headers.TryGetValue("X-Printer-Auth", out var hToken) &&
-                activeSessions.ContainsKey(hToken.ToString().Trim()))
-            {
-                return true;
-            }
-
-            // Check cookie
-            if (req.Cookies.TryGetValue("printman_auth", out var cToken) &&
-                activeSessions.ContainsKey(cToken))
-            {
-                return true;
-            }
-
-            // Check query param PIN (convenience for EventSource / direct links)
-            if (req.Query.TryGetValue("pin", out var qPin) &&
-                string.Equals(qPin.ToString().Trim(), pin, StringComparison.Ordinal))
-            {
-                return true;
-            }
-
-            // Check query param token
-            if (req.Query.TryGetValue("token", out var qToken) &&
-                activeSessions.ContainsKey(qToken.ToString().Trim()))
-            {
-                return true;
-            }
-
-            return false;
-        }
-
-        bool IsSafeOrigin(HttpRequest req)
-        {
-            // Custom header check: Browsers prevent cross-origin forms from setting custom headers
-            if (req.Headers.ContainsKey("X-Requested-With") ||
-                req.Headers.ContainsKey("X-Printer-Pin") ||
-                req.Headers.ContainsKey("X-Printer-Auth"))
-            {
-                return true;
-            }
-
-            // Origin verification against known local hosts
-            if (req.Headers.TryGetValue("Origin", out var originVal) && !string.IsNullOrWhiteSpace(originVal))
-            {
-                if (Uri.TryCreate(originVal.ToString(), UriKind.Absolute, out var originUri))
-                {
-                    if (originUri.IsLoopback ||
-                        lanIps.Contains(originUri.Host, StringComparer.OrdinalIgnoreCase) ||
-                        originUri.Host.Equals(Environment.MachineName, StringComparison.OrdinalIgnoreCase))
-                    {
-                        return true;
-                    }
-                    return false;
-                }
-            }
-
-            return true;
-        }
+            ctx.Response.Headers["X-Content-Type-Options"] = "nosniff";
+            ctx.Response.Headers["Referrer-Policy"] = "no-referrer";
+            ctx.Response.Headers["Cache-Control"] = "no-store";
+            await next();
+        });
 
         // Port separation: the IPP port only serves /ipp/*, the web port never does.
         // Without the web UI the only listener is the IPP port, so everything outside /ipp/* is a 404.
@@ -307,7 +264,7 @@ public class PrintingWebServerHost(
                     HttpMethods.IsPut(ctx.Request.Method) ||
                     HttpMethods.IsDelete(ctx.Request.Method))
                 {
-                    if (!IsSafeOrigin(ctx.Request))
+                    if (!WebSessionSecurity.IsSafeOrigin(ctx.Request))
                     {
                         ctx.Response.StatusCode = StatusCodes.Status403Forbidden;
                         await ctx.Response.WriteAsJsonAsync(new { error = "Cross-origin request rejected." });
@@ -373,16 +330,16 @@ public class PrintingWebServerHost(
                 return Results.Ok(new { success = true, token = "none" });
             }
 
-            if (!string.IsNullOrWhiteSpace(req.Pin) && string.Equals(req.Pin.Trim(), pin, StringComparison.Ordinal))
+            if (!string.IsNullOrWhiteSpace(req.Pin) && sessions.VerifyPin(req.Pin))
             {
-                var token = Convert.ToHexString(RandomNumberGenerator.GetBytes(16)).ToLowerInvariant();
-                activeSessions[token] = DateTime.UtcNow.AddDays(7);
+                var token = sessions.CreateSession();
 
                 res.Cookies.Append("printman_auth", token, new CookieOptions
                 {
                     HttpOnly = true,
                     SameSite = SameSiteMode.Strict,
-                    Expires = DateTimeOffset.UtcNow.AddDays(7)
+                    Secure = res.HttpContext.Request.IsHttps,
+                    Expires = DateTimeOffset.UtcNow + WebSessionSecurity.SessionLifetime
                 });
 
                 return Results.Ok(new { success = true, token });
@@ -401,7 +358,7 @@ public class PrintingWebServerHost(
         // 4. Printer Info
         app.MapGet("/api/printers/{name}", (string name) =>
         {
-            var printer = _printerDiscovery.FindPrinter(name);
+            var printer = FindLocalPrinter(name);
             return printer != null ? Results.Ok(printer) : Results.NotFound(new { error = $"Printer '{name}' not found." });
         });
 
@@ -481,7 +438,14 @@ public class PrintingWebServerHost(
                 return Results.BadRequest(new { error = "No items specified to print." });
             }
 
-            _pipeline.Enqueue(ToPipelineBatch(req));
+            if (req.Items.Count > PrintJobPipeline.MaxBatchItems ||
+                req.Items.Any(item => item == null || !FileCacheService.IsValidFileId(item.FileId) || item.Copies is < 1 or > 99))
+                return Results.BadRequest(new { error = "Invalid document ID, copy count or batch size." });
+            var printer = FindLocalPrinter(req.Printer);
+            if (printer == null) return Results.NotFound(new { error = "Local printer not found." });
+            var ticket = _pipeline.Enqueue(ToPipelineBatch(req, printer.Name));
+            if (ticket.State == PipelineJobState.Failed)
+                return Results.Json(new { error = "Print queue is full or unavailable." }, statusCode: 503);
             int currentPos = Math.Max(1, _pipeline.PendingCount);
 
             _eventHub.Publish(new PrintEvent
@@ -540,9 +504,8 @@ public class PrintingWebServerHost(
         // 8. Queue Inspection and Management
         app.MapGet("/api/queue", (string? printer) =>
         {
-            var targetPrinter = !string.IsNullOrWhiteSpace(printer)
-                ? _printerDiscovery.FindPrinter(printer)?.Name ?? printer
-                : _printerDiscovery.GetDefaultPrinter()?.Name;
+            var targetPrinter = FindLocalPrinter(printer)?.Name;
+            if (targetPrinter == null) return Results.NotFound(new { error = "Local printer not found." });
 
             var jobs = _queueService.GetJobs(targetPrinter);
             var status = !string.IsNullOrWhiteSpace(targetPrinter) ? _queueService.GetPrinterStatus(targetPrinter) : null;
@@ -556,7 +519,9 @@ public class PrintingWebServerHost(
 
         app.MapGet("/api/printers/{name}/status", (string name) =>
         {
-            var status = _queueService.GetPrinterStatus(name);
+            var printer = FindLocalPrinter(name);
+            if (printer == null) return Results.NotFound(new { error = "Local printer not found." });
+            var status = _queueService.GetPrinterStatus(printer.Name);
             return Results.Ok(status);
         });
 
@@ -567,7 +532,9 @@ public class PrintingWebServerHost(
                 return Results.BadRequest(new { error = "Job ID must be specified." });
             }
 
-            bool cancelled = _queueService.CancelJob(req.Printer, req.JobId);
+            var printer = FindLocalPrinter(req.Printer);
+            if (printer == null) return Results.NotFound(new { error = "Local printer not found." });
+            bool cancelled = _queueService.CancelJob(printer.Name, req.JobId);
             _eventHub.Publish(new PrintEvent
             {
                 Type = "queue_updated",
@@ -589,7 +556,9 @@ public class PrintingWebServerHost(
                 return Results.BadRequest(new { error = "Printer name must be specified." });
             }
 
-            int purged = _queueService.PurgeSpoolerQueue(req.Printer);
+            var printer = FindLocalPrinter(req.Printer);
+            if (printer == null) return Results.NotFound(new { error = "Local printer not found." });
+            int purged = _queueService.PurgeSpoolerQueue(printer.Name);
             _eventHub.Publish(new PrintEvent
             {
                 Type = "queue_updated",
@@ -623,12 +592,12 @@ public class PrintingWebServerHost(
 
             Console.WriteLine("\n  Access from this machine or your phone on the same Wi-Fi:");
             Console.ForegroundColor = ConsoleColor.Cyan;
-            string pinQuery = requireAuth ? $"?pin={pin}" : "";
-            Console.WriteLine($"    Local:    http://localhost:{port}/{pinQuery}");
+
+            Console.WriteLine($"    Local:    http://localhost:{port}/");
 
             foreach (var ip in lanIps)
             {
-                Console.WriteLine($"    Network:  http://{ip}:{port}/{pinQuery}");
+                Console.WriteLine($"    Network:  http://{ip}:{port}/");
             }
             Console.ResetColor();
         }
@@ -769,9 +738,9 @@ public class PrintingWebServerHost(
         }
     }
 
-    private static PipelineBatch ToPipelineBatch(WebBatchPrintRequest req) => new()
+    private static PipelineBatch ToPipelineBatch(WebBatchPrintRequest req, string printerName) => new()
     {
-        Printer = req.Printer,
+        Printer = printerName,
         Source = "web",
         Items = req.Items.Select(item =>
         {

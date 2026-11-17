@@ -13,7 +13,7 @@ namespace Printman.Tests.Ipp;
 /// real IPP wire messages so every operation, status code and job-template parser branch is validated.
 /// </summary>
 [TestClass]
-public sealed class IppRequestHandlerTests
+public sealed partial class IppRequestHandlerTests
 {
     private const string DefaultSlug = "fake-printer";
 
@@ -225,7 +225,7 @@ public sealed class IppRequestHandlerTests
 
         var printer = response.Group(IppTag.PrinterAttributes)!;
         Assert.AreEqual(
-            "http://printman.local:631/ipp/print/fake-printer",
+            $"http://printman.local:{h.Settings.IppPort}/ipp/print/fake-printer",
             printer.Get("printer-more-info")!.First!.AsString());
     }
 
@@ -314,7 +314,7 @@ public sealed class IppRequestHandlerTests
         Assert.AreEqual("Fake Printer", batch.Printer);
         var item = batch.Items[0];
         Assert.IsTrue(item.FullPage);
-        Assert.AreEqual("Network print job (#1, 192.168.1.50)", item.DisplayName);
+        Assert.AreEqual($"Network print job (#{JobId(response)}, 192.168.1.50)", item.DisplayName);
     }
 
     [TestMethod]
@@ -1516,6 +1516,8 @@ public sealed class IppRequestHandlerTests
 
         public FileCacheResult? GetFile(string fileId) => null;
 
+        public bool AddReference(string fileId) => GetFile(fileId) != null;
+        public void ReleaseReference(string fileId, bool deleteIfUnused) { if (deleteIfUnused) DeleteFile(fileId); }
         public bool DeleteFile(string fileId) => false;
 
         public void ClearCache() { }
@@ -1620,6 +1622,8 @@ public sealed class IppRequestHandlerTests
 
         public FileCacheResult? GetFile(string fileId) => null;
 
+        public bool AddReference(string fileId) => GetFile(fileId) != null;
+        public void ReleaseReference(string fileId, bool deleteIfUnused) { if (deleteIfUnused) DeleteFile(fileId); }
         public bool DeleteFile(string fileId) => false;
 
         public void ClearCache() { }
